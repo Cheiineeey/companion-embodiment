@@ -1,6 +1,7 @@
 """A tiny, dependency-free embodied-state reference for companion AIs."""
 
 from dataclasses import dataclass, field
+from math import exp
 from typing import Any, Mapping
 
 
@@ -8,8 +9,20 @@ def _clamp(value: float) -> float:
     return max(0.0, min(1.0, float(value)))
 
 
-def _approach(current: float, target: float, speed: float) -> float:
-    return current + (target - current) * _clamp(speed)
+_BASELINES = {"stress": 0.25, "joy": 0.45, "bond": 0.45, "energy": 0.25}
+_EVENTS = {
+    "threat": {"stress": 0.95, "energy": 0.9},
+    "comfort": {"stress": 0.12, "bond": 0.9},
+    "reunion": {"joy": 0.85, "bond": 0.95, "energy": 0.55},
+    "separation": {"stress": 0.75, "joy": 0.15, "bond": 0.8},
+    "success": {"joy": 0.8, "energy": 0.6},
+}
+_RATES = {
+    "cortisol_like": (0.8, 0.18),
+    "dopamine_like": (0.45, 0.32),
+    "oxytocin_like": (0.25, 0.1),
+    "adrenaline_like": (1.1, 0.55),
+}
 
 
 @dataclass
@@ -21,15 +34,38 @@ class Chemistry:
     oxytocin_like: float = 0.45
     adrenaline_like: float = 0.25
 
-    def move_toward(self, affect: Mapping[str, float], speed: float = 0.35) -> None:
+    def move_toward(self, affect: Mapping[str, float], event_kind: str | None, dt: float) -> None:
+        signals = _BASELINES | _EVENTS.get(event_kind, {}) | dict(affect)
+        stress = _clamp(signals["stress"])
+        joy = _clamp(signals["joy"])
+        bond = _clamp(signals["bond"])
+        energy = _clamp(signals["energy"])
+
+        # Attachment buffers stress; stress dampens pleasure and, more gently, closeness.
+        stress_delta = stress - _BASELINES["stress"]
         targets = {
-            "cortisol_like": affect.get("stress", self.cortisol_like),
-            "dopamine_like": affect.get("joy", self.dopamine_like),
-            "oxytocin_like": affect.get("bond", self.oxytocin_like),
-            "adrenaline_like": affect.get("energy", self.adrenaline_like),
+            "cortisol_like": _BASELINES["stress"] + stress_delta * (1.0 - 0.3 * bond),
+            "dopamine_like": (
+                _BASELINES["joy"]
+                + (joy - _BASELINES["joy"]) * (1.0 - 0.35 * stress)
+                - max(0.0, stress_delta) * 0.2
+            ),
+            "oxytocin_like": (
+                _BASELINES["bond"]
+                + (bond - _BASELINES["bond"]) * (1.0 - 0.15 * stress)
+            ),
+            "adrenaline_like": max(
+                energy,
+                _BASELINES["energy"] + max(0.0, stress_delta) * 0.65,
+            ),
         }
+        dt = max(0.0, float(dt))
         for name, target in targets.items():
-            setattr(self, name, _approach(getattr(self, name), _clamp(target), speed))
+            current = getattr(self, name)
+            rise_rate, fall_rate = _RATES[name]
+            rate = rise_rate if target > current else fall_rate
+            amount = 1.0 - exp(-rate * dt)
+            setattr(self, name, current + (_clamp(target) - current) * amount)
 
 
 @dataclass
@@ -43,10 +79,10 @@ class AnimalBody:
         self,
         affect: Mapping[str, float] | None = None,
         event: Mapping[str, Any] | None = None,
-        speed: float = 0.35,
+        dt: float = 1.0,
     ) -> dict[str, Any]:
         affect, event = affect or {}, event or {}
-        self.chemistry.move_toward(affect, speed)
+        self.chemistry.move_toward(affect, event.get("kind"), dt)
 
         organs = self._organs()
         ears = self._ears(event)
@@ -139,12 +175,17 @@ def _self_check() -> None:
     state = body.step(
         affect={"stress": 0.8, "joy": 0.3, "bond": 0.9, "energy": 0.6},
         event={"called": True, "task": "reach"},
-        speed=1.0,
+        dt=10.0,
     )
     assert state["ears"]["left"].startswith("失聪")
     assert state["ears"]["right"] == "竖起"
     assert state["paws"] == "伸过去"
     assert "不要逐项汇报" in state["prompt_hint"]
+    stressed = state["chemistry"]["cortisol_like"]
+    recovering = body.step(dt=1.0)["chemistry"]["cortisol_like"]
+    assert _BASELINES["stress"] < recovering < stressed
+    alarm = AnimalBody().step(event={"kind": "threat"}, dt=1.0)["chemistry"]
+    assert alarm["adrenaline_like"] - 0.25 > alarm["cortisol_like"] - 0.25
     print(state["prompt_hint"])
     print("self-check: ok")
 

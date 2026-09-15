@@ -32,7 +32,7 @@ from embodiment import AnimalBody
 body = AnimalBody(deaf_ear="left")
 snapshot = body.step(
     affect={"stress": 0.7, "joy": 0.2, "bond": 0.8, "energy": 0.5},
-    event={"called": True, "task": "reach"},
+    event={"kind": "reunion", "called": True, "task": "reach"},
 )
 
 print(snapshot["ears"])
@@ -51,6 +51,27 @@ print(snapshot["prompt_hint"])
 | 爪子 | 伸、收、按、蜷、搭、扒等短时动作 | 永久人格标签 |
 | 喉咙 | 给表达层一个松、紧、哑、轻的参考 | 代替实际回答 |
 
+## 内分泌式状态如何变化
+
+四个数值不是每轮覆盖的情绪标签，而是有不同惯性的叙事状态：
+
+| 状态 | 叙事含义 | 变化手感 |
+|---|---|---|
+| `cortisol_like` | 压力与戒备 | 升得快，退得慢 |
+| `dopamine_like` | 愉快与期待 | 中速升降，会被高压力压低 |
+| `oxytocin_like` | 依恋与安全感 | 累积慢，消退最慢，也会缓冲压力 |
+| `adrenaline_like` | 唤醒与行动准备 | 升得最快，也退得最快 |
+
+`step()` 会先把 `threat`、`comfort`、`reunion`、`separation`、`success` 这五类通用事件变成刺激；调用者传入的 `affect` 可以覆盖它们。随后状态按各自速度接近目标，而不是瞬间跳过去。没有新刺激时，它们会渐渐回到基线，所以一次事件能留下余韵，但不会永久卡住。
+
+```python
+body.step(event={"kind": "threat"}, dt=1.0)  # 肾上腺素先起，压力随后留下
+body.step(event={"kind": "comfort"}, dt=1.0) # 依恋缓慢增加，并缓冲压力
+body.step(dt=1.0)                              # 没有刺激，逐步回到基线
+```
+
+`dt` 是相对时间步，不限定为秒。只要同一个项目始终使用相同单位，状态变化就是一致的。默认参数只是可运行的参考手感，不代表真实生理速度。
+
 ## 两条重要规则
 
 1. **身体提示只是参考。** 不要每轮逐项汇报器官，也不要为了展示状态打断正常回答。
@@ -68,8 +89,8 @@ print(snapshot["prompt_hint"])
 
 ## 当前状态
 
-- 已有：状态缓动、内部器官、耳朵、尾巴、爪子、喉咙、提示输出、自检。
-- 已验证：本地示例可运行；失聪耳朵不会被即时注意事件覆盖。
+- 已有：状态基线、不同升降速度、事件刺激、状态牵制与余韵，以及内部器官、耳朵、尾巴、爪子、喉咙、提示输出和自检。
+- 已验证：本地示例可运行；压力会缓慢恢复；失聪耳朵不会被即时注意事件覆盖。
 - 尚未验证：长期对话中的参数手感，以及不同动物的身体映射。
 
 ## 许可证
