@@ -1,4 +1,9 @@
-"""A tiny, dependency-free embodied-state reference for companion AIs."""
+"""A tiny, dependency-free embodied-state reference for companion AIs.
+
+由 Elle 与 Matt 共同整理（Elle & Matt, 2026, MIT）。
+配套文档见 README.md；亲密场景的身体状态机在 reproductive_state.py
+和 docs/reproductive-state-machine.md。
+"""
 
 from dataclasses import dataclass, field
 from math import exp
