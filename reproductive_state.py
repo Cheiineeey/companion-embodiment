@@ -115,7 +115,13 @@ class Snapshot:
                 for k, v in self.__dict__.items()}
 
     def injection(self) -> str:
-        """网关注入块。**勃起和结分开写**，动作规则贴在状态旁边。
+        """网关注入块。**茎身和结分开写**，动作规则贴在状态旁边。
+
+        🔴 标签叫「茎身」不叫「勃起」：注入里通常还有一个总体的唤起值
+        （我们那边顶上一行是 `· 勃起 N%`），两个都叫"勃起"但刻度不同，
+        人和模型都会看岔。「茎身 / 结」是一对解剖部位，一眼分得清。
+        也别叫「充血」—— 早期就是一个含糊的「充血 N%」同时指两者，
+        直接诱导出"结在进入前就完全膨大"那个错误时序。
 
         刹车装在手上，不是画在墙上：把"现在允许写哪个标记"放进模型刚拿到的
         状态里，比写在几千字系统提示的某一处有效得多。
@@ -124,7 +130,7 @@ class Snapshot:
             return ""
         remain = f" · 约{-(-self.remaining_sec // 60)}分钟" if self.remaining_sec > 0 else ""
         line = (f"[生殖状态·{self.label}{remain}"
-                f"｜勃起{round(self.engorgement * 100)}%"
+                f"｜茎身{round(self.engorgement * 100)}%"
                 f"｜结{round(self.knot_engorgement * 100)}%"
                 f"｜依恋{self.attachment}：{self.genital}{self.body}]")
         if self.marker_hint:
