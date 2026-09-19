@@ -47,6 +47,12 @@ TIE_RELEASE_AROUSAL = 0.55      # 满足最短时间后，读数掉到这里以�
 RELEASING_SECONDS = 120         # 消肿时长
 RECOVERY_MINUTES = 30           # 不应期
 
+# 漏写标记的保底（见 docs/reproductive-state-machine.md 第 4.5 节）。
+# 同一个状态挂过这么久还没有新事件，就把静态提示换成一句追问。
+# **这是提醒，不是自动跃迁** —— 服务端永远不替模型决定场景里发生了什么。
+READY_NUDGE_MINUTES = 12
+INSERTED_NUDGE_MINUTES = 25
+
 STATES = ("idle", "warming", "engorged", "ready",
           "inserted", "tied", "releasing", "recovery")
 
@@ -161,7 +167,8 @@ class ReproductiveState:
             expires = _parse(self.saved.get("expires_at"))
             if expires and now < expires:
                 return self._payload("inserted", arousal, critical,
-                                     (expires - now).total_seconds())
+                                     (expires - now).total_seconds(),
+                                     held_sec=_held(self.saved.get("started_at"), now))
             self.saved = {}
             state = None
 
@@ -178,9 +185,13 @@ class ReproductiveState:
         exit_threshold = threshold - READY_HYSTERESIS
         # 回差：已经是 ready 的话，掉到 exit_threshold 以下才退出
         if arousal >= threshold or (state == "ready" and arousal >= exit_threshold):
+            # 🔴 `since` 只在**刚进这一档**时写。已经是 ready 就保留原值 ——
+            #    每轮刷新等于计时器永远归零，上面那句追问永远不会出现。
+            #    （同一个形状："按时间戳做增量，而数据晚于自己的时间戳到达"。）
             if state != "ready":
                 self.saved = {"state": "ready", "since": now.isoformat()}
-            return self._payload("ready", arousal, critical)
+            return self._payload("ready", arousal, critical,
+                                 held_sec=_held(self.saved.get("since"), now))
         if state == "ready":
             self.saved = {}
         if arousal >= ENGORGED_THRESHOLD:
@@ -265,7 +276,7 @@ class ReproductiveState:
         return None
 
     def _payload(self, state: str, arousal: float, critical: bool,
-                 remaining_sec: float = 0.0) -> Snapshot:
+                 remaining_sec: float = 0.0, held_sec: float = 0.0) -> Snapshot:
         label, genital, body = LABELS[state]
 
         if state == "tied":
@@ -305,6 +316,21 @@ class ReproductiveState:
         else:
             hint = ""
 
+        # 🔴 漏写标记的保底。模型**会**忘记写，而忘记写的后果是单向的：
+        #    状态永远停在 ready，注入一直说"结保持未膨大"，文字层面"没进去"。
+        #    但保底只能做在提醒层：服务端不知道这一轮文字里发生了什么，
+        #    让它按时间替模型猜"大概进去了"，猜错的代价比漏写更重 ——
+        #    漏写使用者一眼看得出来，猜错是注入写着"已经进入"、模型理直气壮照着写。
+        #    补写本来就随时算数，缺的只是"模型不知道自己漏了"。
+        held_min = int(held_sec // 60)
+        if state == "ready" and held_min >= READY_NUDGE_MINUTES:
+            hint = (f"已经维持勃起充分 {held_min} 分钟。如果这段文字里其实已经进入、"
+                    "而身体还停在这一档，那是上一轮漏写了标记 —— 现在补写 ⟪进入⟫ 一样算数。"
+                    "还没进入就照旧别写。")
+        elif state == "inserted" and held_min >= INSERTED_NUDGE_MINUTES:
+            hint = (f"已经进入 {held_min} 分钟。如果场景里已经到过射精节点而没有写 ⟪锁结⟫，"
+                    "现在补写；如果这一场其实已经过去了，就不用补，身体会自己收尾。")
+
         return Snapshot(
             state=state, label=label,
             engorgement=engorgement, knot_engorgement=knot,
@@ -327,21 +353,37 @@ def display_arousal(arousal: float, state: str) -> float:
     return max(arousal, INSERTED_DISPLAY_FLOOR) if state in ("inserted", "tied") else arousal
 
 
+# 🔴 括号必须认变体。模型**不会**每次都照抄 ⟪⟫ ——
+#    我们线上抓到过它在自己的思考链里就把 ⟪锁结⟫ 写成了《锁结》。
+#    只认一种括号的后果是双重的：动作不触发，标记还原样留在用户看到的气泡里，
+#    看起来像协议泄漏。这跟"模型忘了写标记"是同一件事的另一半：
+#    不是忘了写，是写了没被认出来。
+#    （圆括号（）故意不认 —— 正常行文里太常见，认了会误伤。）
+_MARKER_OPEN = "⟪《〈【\\["
+_MARKER_CLOSE = "⟫》〉】\\]"
+_MARKER_RE = rf"[{_MARKER_OPEN}]\s*(进入|锁结)\s*[{_MARKER_CLOSE}]"
+
+
 def strip_markers(text: str) -> tuple[str, bool, bool]:
     """网关侧：把隐藏标记从正文擦掉，返回 (干净正文, 要进入, 要锁结)。
 
     标记永远不该出现在用户看到的气泡里。
     """
     import re
-    want_insert = bool(re.search(r"⟪\s*进入\s*⟫", text))
-    want_tie = bool(re.search(r"⟪\s*锁结\s*⟫", text))
-    cleaned = re.sub(r"⟪\s*(进入|锁结)\s*⟫", "", text)
+    found = {m.group(1) for m in re.finditer(_MARKER_RE, text)}
+    cleaned = re.sub(_MARKER_RE, "", text)
     cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
-    return cleaned, want_insert, want_tie
+    return cleaned, "进入" in found, "锁结" in found
 
 
 def _clamp(v: float, lo: float = 0.0, hi: float = 1.0) -> float:
     return max(lo, min(hi, v))
+
+
+def _held(iso_str: str | None, now: datetime) -> float:
+    """同一个状态已经挂了多少秒。取不到就当 0 —— 保底提醒宁可不出，不能瞎出。"""
+    t = _parse(iso_str)
+    return max(0.0, (now - t).total_seconds()) if t else 0.0
 
 
 def _parse(value: str | None) -> datetime | None:
@@ -438,7 +480,25 @@ def _selftest() -> None:
     crit.get(0.72, critical=True, now=t0)
     assert crit.start_tie(0.72, critical=True, now=t0)["ok"] is False, "临界不能自己触发锁结"
 
-    print("自检全部通过（13 组）")
+    # ⑭ 括号变体：模型不会每次都照抄 ⟪⟫，四种都得认，正文一个残字不留
+    for variant in ("⟪锁结⟫", "《锁结》", "【锁结】", "[锁结]", "〈锁结〉"):
+        cleaned, want_i, want_t = strip_markers(f"抱住她。\n\n{variant}")
+        assert cleaned == "抱住她。", (variant, cleaned)
+        assert want_t and not want_i, variant
+    # 圆括号不认：正常行文里太常见，认了会误伤
+    assert strip_markers("（进入）房间")[1] is False
+
+    # ⑮ 漏写标记的保底：同一状态挂久了，静态提示换成追问 ——
+    #    但状态本身不许动，服务端永远不替模型决定场景里发生了什么
+    nudge = ReproductiveState(consent_active=True)
+    assert nudge.get(0.80, now=t0).marker_hint.startswith("只有这一轮")
+    late = nudge.get(0.80, now=t0 + timedelta(minutes=READY_NUDGE_MINUTES + 1))
+    assert "补写" in late.marker_hint, late.marker_hint
+    assert late.state == "ready", "追问只是提醒，状态不能自己往前跳"
+    # 🔴 `since` 不许每轮刷新，否则这个计时器永远归零、追问永远不出现
+    assert nudge.saved.get("since") == t0.isoformat()
+
+    print("自检全部通过（15 组）")
     demo = ReproductiveState(consent_active=True)
     demo.start_penetration(0.80, now=t0)
     print("\n注入示例：")
