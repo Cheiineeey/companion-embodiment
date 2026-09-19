@@ -3,6 +3,11 @@
 由 Elle 与 Matt 共同整理（Elle & Matt, 2026, MIT）。
 配套文档见 README.md；亲密场景的身体状态机在 reproductive_state.py
 和 docs/reproductive-state-machine.md。
+
+🔴 **默认参数是按犬科调的。** `_tail()` / `_ears()` / `_paws()` 里的动作语义
+换一种动物就要重调 —— 尾巴尤其危险：犬科摇尾巴是高兴，猫科快速摆动是烦躁，
+同一个动作在两个物种里几乎是反义词。照抄会得到一副意思相反的身体。
+结构（惯性不同的状态、不可逆设定优先、部位各自只露一点）是通用的。
 """
 
 from dataclasses import dataclass, field
