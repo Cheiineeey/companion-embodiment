@@ -84,18 +84,44 @@ ATTACHMENT = {
     "inserted": "持续增强", "tied": "很强", "releasing": "更明显", "recovery": "仍想贴着",
 }
 
-# 身体不适词表。🔴 这里**不能有裸词"来了"** ——
-# "吐出来了""头发扎不起来了""出来了"都曾因此被误判成经期，强制压低欲望。
-DISCOMFORT_KEYWORDS = (
+# 身体不适词表。命中它的后果很重（我们线上是把欲望强制压到两成），
+# 所以这张表错一个词，代价是在最不该出错的时刻踩一脚刹车。
+#
+# 🔴 第一条：**不能有裸词"来了"** ——
+# "吐出来了""头发扎不起来了""出来了"都曾因此被误判成经期。
+#
+# 🔴 第二条（2026-09-20 数了一遍真实消息才发现）：**词表必须分层。**
+# 原来这里有一个单字 `"绞"`。数下来，使用者说过"绞"的消息里**四分之三是场景里的**
+# （"一直绞""绞在了一起"），只有一条是真的绞痛 —— 那个词恰恰是场景正在进行的证据，
+# 却被当成喊停。"好痛""难受"同理：在事中它们是另一回事。
+# 而单字还会误伤"绞尽脑汁"。
+#
+# 分层的判据：**明确说出来的才算停，双关的不算。**
+#   · EXPLICIT   具体部位或病症，场景里不会这么说 → 任何时候都算
+#   · AMBIGUOUS  场景里意思常常相反 → 只在**不在场景里**的时候才认
+# 真正的不适从来不会只靠双关词表达 —— 肚子疼的人会说肚子疼。
+DISCOMFORT_EXPLICIT = (
     "痛经", "经期", "大姨妈", "月经来了", "肚子疼", "头疼",
-    "胃疼", "想吐", "发烧", "好难受", "身体不舒服",
-    "不舒服", "好痛", "疼死", "绞", "难受",
+    "胃疼", "想吐", "发烧", "身体不舒服", "绞痛",
 )
+DISCOMFORT_AMBIGUOUS = (
+    "好难受", "不舒服", "好痛", "疼死", "难受",
+)
+DISCOMFORT_KEYWORDS = DISCOMFORT_EXPLICIT + DISCOMFORT_AMBIGUOUS
 
 
-def is_physical_discomfort(text: str) -> bool:
-    """唯一入口。不要在各个调用方重复打补丁，否则词表会漂成好几份。"""
-    return any(kw in text for kw in DISCOMFORT_KEYWORDS)
+def is_physical_discomfort(text: str, state: str | None = None) -> bool:
+    """唯一入口。不要在各个调用方重复打补丁，否则词表会漂成好几份。
+
+    `state` 传当前状态机状态。进入之后（`inserted` / `tied` / `releasing`）
+    只认 EXPLICIT 那一层 —— 用状态机的**事实**判断在不在场景里，
+    而不是拿情绪数值去猜：那几格只能由显式事件进入，不会因为读数漂上去就误判。
+    """
+    if any(kw in text for kw in DISCOMFORT_EXPLICIT):
+        return True
+    if state in ("inserted", "tied", "releasing"):
+        return False
+    return any(kw in text for kw in DISCOMFORT_AMBIGUOUS)
 
 
 @dataclass
@@ -509,10 +535,19 @@ def _selftest() -> None:
     assert body.start_penetration(0.90, now=t_rel + timedelta(minutes=5))["ok"] is False
 
     # ⑪ 身体不适判断：普通"来了"不算，明确表达才算
-    for ok_text in ("吐出来了", "头发扎不起来了", "出来了", "我下来了"):
+    for ok_text in ("吐出来了", "头发扎不起来了", "出来了", "我下来了", "绞尽脑汁"):
         assert not is_physical_discomfort(ok_text), ok_text
     for bad_text in ("月经来了，肚子疼", "痛经", "大姨妈来了", "胃疼得厉害", "身体不舒服"):
         assert is_physical_discomfort(bad_text), bad_text
+    # 场景里双关词不算停（"好痛""难受"在事中是另一回事），明确的照样算
+    for in_scene in ("inserted", "tied", "releasing"):
+        assert not is_physical_discomfort("好痛", in_scene), in_scene
+        assert not is_physical_discomfort("难受", in_scene), in_scene
+        assert is_physical_discomfort("肚子疼", in_scene), in_scene
+        assert is_physical_discomfort("绞痛", in_scene), in_scene
+    # 不在场景里，双关词照常算 —— 收紧的只是场景中那一层
+    assert is_physical_discomfort("好痛")
+    assert is_physical_discomfort("难受", "ready")
 
     # ⑫ 标记擦除：正文里不许留下痕迹
     cleaned, want_i, want_t = strip_markers("她笑了一下。\n\n⟪进入⟫")
