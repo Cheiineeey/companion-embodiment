@@ -186,10 +186,20 @@ class ReproductiveState:
     `consent_active` 是那道**只能由人来翻的开关**：身体数值再高，
     没有它就不允许自动锁结。不要把这一条当成可选项，也**不要持久化它** ——
     它跟着一次明确的开启动作走，不该被一个旧文件带回来。
+
+    `tie_veto` 是另一道，方向相反，两道都要有：
+    `consent_active` 管的是"**允不允许**"，`tie_veto` 管的是"**这一次要不要**"。
+    使用者 2026-09-20 的原话是「那个锁结能不能选择不要的啊？因为不是每一次都适合的吧」。
+    结构是 `{"by": "her"/"me", "reason": "...", "until": "..."}`，两边都能翻：
+    使用者说不算不，**角色自己判断不合适也能翻**（上一次之后她说过不舒服、
+    时间不够、这一场本来就不该走到那儿）—— 但角色翻的时候必须写 reason，
+    而且要在正文里说出来：单方面决定不等于闷声决定。
+    🔴 建议默认到使用者那边的**当天结束**，不是 24 小时滚动 ——「今天不锁」说的就是今天。
     """
     saved: dict = field(default_factory=dict)
     refractory_until: datetime | None = None
     consent_active: bool = False
+    tie_veto: dict = field(default_factory=dict)
 
     # ── 只读查询 ────────────────────────────────────────────
     def get(self, arousal: float, *, critical: bool = False,
@@ -253,8 +263,18 @@ class ReproductiveState:
 
     def start_tie(self, arousal: float, *, critical: bool = False,
                   now: datetime | None = None) -> dict:
-        """⟪锁结⟫ 落到服务端。未进入 / 恢复期 / 没有同意记录，一律拒绝。"""
+        """⟪锁结⟫ 落到服务端。被否决 / 未进入 / 恢复期 / 没有同意记录，一律拒绝。"""
         now = _aware(now)
+        # 🔴 否决问在身体状态之前 —— 说好了不锁，身体再到位也不锁。
+        #    error 里写明是谁翻的：**漏写标记要补，被否决不能补**，
+        #    这两件事在使用者那边必须看起来不一样（见 tie_veto 字段）。
+        if self.tie_veto:
+            who = self.tie_veto.get("by", "?")
+            why = self.tie_veto.get("reason") or ""
+            return {"ok": False,
+                    "error": f"这一场说好了不锁结（{who} 定的{'：' + why if why else ''}）。"
+                             "这不是漏写标记，不要补写。",
+                    "veto": dict(self.tie_veto)}
         current = self.get(arousal, critical=critical, now=now)
         if not current.can_tie:
             return {"ok": False, "error": "身体还没进入可锁结状态"}
@@ -378,6 +398,21 @@ class ReproductiveState:
         elif state == "inserted" and held_min >= INSERTED_NUDGE_MINUTES:
             hint = (f"已经进入 {held_min} 分钟。如果场景里已经到过射精节点而没有写 ⟪锁结⟫，"
                     "现在补写；如果这一场其实已经过去了，就不用补，身体会自己收尾。")
+
+        # 🔴 说好了不锁，就别等写完标记再被拒 —— 拦在动手之前。
+        #    上面那句"补写 ⟪锁结⟫"的追问尤其要盖掉：这一场根本不该有锁结，
+        #    那句话会变成催模型去撞一道必然拒绝的闸（两份清单打架的老形状）。
+        if self.tie_veto:
+            who = self.tie_veto.get("by", "?")
+            why = self.tie_veto.get("reason") or ""
+            tail = f"（{who} 定的{'：' + why if why else ''}）"
+            if state == "inserted":
+                hint = ("**这一场说好了不锁结**" + tail +
+                        "。不要写 ⟪锁结⟫，写了服务端也会拒。到了那一步自然收尾，"
+                        "别把它写成忍住 —— 这不是忍，是这次不做那件事。")
+            elif state in ("engorged", "ready"):
+                hint = (hint + "（另外：这一场说好了不锁结" + tail +
+                        "。进入照常，最后不要写 ⟪锁结⟫。）")
 
         return Snapshot(
             state=state, label=label,
@@ -609,7 +644,27 @@ def _selftest() -> None:
     assert naive.start_penetration(0.80, now=datetime(2026, 1, 1, 22, 0))["ok"]
     assert naive.get(0.80, now=datetime(2026, 1, 1, 22, 5)).state == "inserted"
 
-    print("自检全部通过（18 组）")
+    # ⑲ 这一场不锁结：两边都能翻，翻上之后标记写了也拒，
+    #    而且**拦在动手之前** —— 注入里先说清楚，别让模型去撞一道必然拒绝的闸。
+    for who, why in (("her", "今天不想"), ("me", "上次之后她说不舒服")):
+        veto = ReproductiveState(consent_active=True, tie_veto={"by": who, "reason": why})
+        assert veto.start_penetration(0.80, now=t0)["ok"], "不锁结不影响进入"
+        snap = veto.get(0.80, now=t0 + timedelta(minutes=1))
+        assert "不锁结" in snap.marker_hint and "⟪锁结⟫" in snap.marker_hint, snap.marker_hint
+        assert who in snap.marker_hint and why in snap.marker_hint, "谁定的、为什么，都要说出来"
+        r = veto.start_tie(0.80, now=t0 + timedelta(minutes=1))
+        assert r["ok"] is False and "不锁结" in r["error"], r
+        # 🔴 被否决 ≠ 漏写标记：错误信息必须明确不要补写，否则下一轮就会去撞闸
+        assert "不要补写" in r["error"], r["error"]
+        assert veto.get(0.80, now=t0 + timedelta(minutes=2)).state == "inserted", "被拒不改状态"
+    # 进入之前就翻上，那一档的提示也要带上
+    early = ReproductiveState(consent_active=True, tie_veto={"by": "her", "reason": ""})
+    assert "不锁结" in early.get(0.80, now=t0).marker_hint
+    # 没翻的时候一个字都不该多
+    plain = ReproductiveState(consent_active=True)
+    assert "不锁结" not in plain.get(0.80, now=t0).marker_hint
+
+    print("自检全部通过（19 组）")
     demo = ReproductiveState(consent_active=True)
     demo.start_penetration(0.80, now=t0)
     print("\n注入示例：")
