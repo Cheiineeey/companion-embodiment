@@ -148,9 +148,18 @@ class Snapshot:
 class ReproductiveState:
     """状态机本体。
 
-    持久化只需要一个很小的 dict（状态名 + 几个时间戳），不需要数据库。
+    持久化只需要 `saved` 这一个 dict（状态名 + 几个时间戳），不需要数据库：
+
+        json.dumps(body.saved)                     # 存
+        ReproductiveState(saved=json.loads(raw))   # 读回来
+
+    🔴 **不应期也在 `saved` 里**，别只存"当前状态"那几个键 ——
+    进入 `recovery` 时 state 恰好被清掉，漏存那一项的后果是重启后
+    30 分钟不应期凭空消失，而且看起来一切正常（见自检第 ⑰ 组）。
+
     `consent_active` 是那道**只能由人来翻的开关**：身体数值再高，
-    没有它就不允许自动锁结。不要把这一条当成可选项。
+    没有它就不允许自动锁结。不要把这一条当成可选项，也**不要持久化它** ——
+    它跟着一次明确的开启动作走，不该被一个旧文件带回来。
     """
     saved: dict = field(default_factory=dict)
     refractory_until: datetime | None = None
@@ -159,7 +168,7 @@ class ReproductiveState:
     # ── 只读查询 ────────────────────────────────────────────
     def get(self, arousal: float, *, critical: bool = False,
             now: datetime | None = None) -> Snapshot:
-        now = now or datetime.now(timezone.utc)
+        now = _aware(now)
         state = self.saved.get("state")
 
         # inserted：有兜底过期，避免忘了结束就永远挂着
@@ -204,7 +213,7 @@ class ReproductiveState:
     def start_penetration(self, arousal: float, *, critical: bool = False,
                           now: datetime | None = None) -> dict:
         """⟪进入⟫ 落到服务端。**不信任标记本身**，这里独立校验一次。"""
-        now = now or datetime.now(timezone.utc)
+        now = _aware(now)
         if self._refractory_remaining(now) > 0:
             return {"ok": False, "error": "仍在恢复期"}
         if arousal < PENETRATION_MIN_AROUSAL:
@@ -219,7 +228,7 @@ class ReproductiveState:
     def start_tie(self, arousal: float, *, critical: bool = False,
                   now: datetime | None = None) -> dict:
         """⟪锁结⟫ 落到服务端。未进入 / 恢复期 / 没有同意记录，一律拒绝。"""
-        now = now or datetime.now(timezone.utc)
+        now = _aware(now)
         current = self.get(arousal, critical=critical, now=now)
         if not current.can_tie:
             return {"ok": False, "error": "身体还没进入可锁结状态"}
@@ -238,18 +247,32 @@ class ReproductiveState:
 
     def stop(self, now: datetime | None = None) -> dict:
         """紧急手动结束。正常解除不需要它 —— 忘了点就一直卡着，那是设计缺陷。"""
-        now = now or datetime.now(timezone.utc)
+        now = _aware(now)
         previous = self.saved.get("state")
-        self.saved = {}
         if previous in ("ready", "inserted", "tied", "releasing"):
-            self.refractory_until = now + timedelta(minutes=RECOVERY_MINUTES)
+            self._enter_recovery(now)
+        else:
+            self.saved = {}
         return {"ok": True, "previous": previous}
 
     # ── 内部 ────────────────────────────────────────────────
     def _refractory_remaining(self, now: datetime) -> float:
-        if not self.refractory_until:
+        # 🔴 不应期优先从 `saved` 里读。
+        #    早期版本它只活在 `self.refractory_until` 这个独立字段上，而进入
+        #    recovery 时 `saved` 正好被清空 —— 于是"持久化只要存 saved"这句话
+        #    在别的地方都成立，**唯独在这一格不成立**：进程一重启，
+        #    30 分钟不应期凭空消失，而 saved 是空的、状态显示 idle，
+        #    看起来完全正常。不报错、不留痕、闸没了，是最难查的那一种。
+        until = _parse(self.saved.get("refractory_until")) or self.refractory_until
+        if not until:
             return 0.0
-        return max(0.0, (self.refractory_until - now).total_seconds() / 60)
+        return max(0.0, (until - now).total_seconds() / 60)
+
+    def _enter_recovery(self, now: datetime) -> None:
+        """清空状态并开始不应期。**两样都写进 saved**，存一个 dict 就够了。"""
+        until = now + timedelta(minutes=RECOVERY_MINUTES)
+        self.refractory_until = until
+        self.saved = {"refractory_until": until.isoformat()}
 
     def _advance_tie(self, state: str, arousal: float, critical: bool,
                      now: datetime) -> Snapshot | None:
@@ -271,8 +294,7 @@ class ReproductiveState:
             self.saved["state"] = "releasing"
             return self._payload("releasing", arousal, critical,
                                  (release_end - now).total_seconds())
-        self.saved = {}
-        self.refractory_until = now + timedelta(minutes=RECOVERY_MINUTES)
+        self._enter_recovery(now)
         return None
 
     def _payload(self, state: str, arousal: float, critical: bool,
@@ -372,8 +394,32 @@ def strip_markers(text: str) -> tuple[str, bool, bool]:
     import re
     found = {m.group(1) for m in re.finditer(_MARKER_RE, text)}
     cleaned = re.sub(_MARKER_RE, "", text)
+    # 🔴 擦完要把"标记周围的壳"一起收走，否则用户会看到孤零零的残渣。
+    #    实测模型这样写过，两种都会在气泡里留下痕迹：
+    #      "…停住了。\n\n⟪锁结⟫。"   → 擦完剩一个光秃秃的 "。"
+    #      "…停住了。\n\n**⟪锁结⟫**" → 擦完剩 "****"
+    #    单擦标记本身是不够的 —— 模型会给它加粗、加标点、包引号。
+    #    只清理**整行只剩这些**的行，别动正文里的标点。
+    lines = []
+    for ln in cleaned.split("\n"):
+        lines.append("" if ln.strip() and not any(ch.isalnum() for ch in ln) else ln)
+    cleaned = "\n".join(lines)
     cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
     return cleaned, "进入" in found, "锁结" in found
+
+
+def _aware(dt: datetime | None) -> datetime:
+    """把传进来的时间统一成带时区的。
+
+    🔴 这里原来直接用调用方给的 `now`，而内部存的时间戳都是 UTC aware。
+    于是最自然的那种写法 —— `body.get(0.8, now=datetime.now())` ——
+    会在第二次调用时抛 `TypeError: can't compare offset-naive and
+    offset-aware datetimes`，而且第一次调用是好的，报错出现在"后来某一轮"。
+    naive 的时间一律当 UTC 收下，别让接入的人栽在这上面。
+    """
+    if dt is None:
+        return datetime.now(timezone.utc)
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
 
 
 def _clamp(v: float, lo: float = 0.0, hi: float = 1.0) -> float:
@@ -498,7 +544,37 @@ def _selftest() -> None:
     # 🔴 `since` 不许每轮刷新，否则这个计时器永远归零、追问永远不出现
     assert nudge.saved.get("since") == t0.isoformat()
 
-    print("自检全部通过（15 组）")
+    # ⑯ 标记周围的壳也要收走：模型会给它加粗、加标点、包引号，
+    #    单擦标记本身会在用户气泡里留下 "。" 或 "****" 这种残渣
+    for shell in ("⟪锁结⟫。", "**⟪锁结⟫**", "「⟪锁结⟫」"):
+        cleaned, _, want_t = strip_markers(f"抱住她。\n\n{shell}")
+        assert cleaned == "抱住她。", (shell, cleaned)
+        assert want_t, shell
+    # 但正文里的标点一个都不许动
+    assert strip_markers("她说：「别。」")[0] == "她说：「别。」"
+
+    # ⑰ 持久化：**存 `saved` 这一个 dict 就够了**，不应期也在里面。
+    #    早期不应期只活在 self.refractory_until 上，而进 recovery 时 saved
+    #    正好被清空 —— 重启后 30 分钟不应期凭空消失，还看不出哪里不对。
+    ref = ReproductiveState(consent_active=True)
+    ref.start_penetration(0.80, now=t0)
+    ref.start_tie(0.80, now=t0 + timedelta(minutes=1))
+    # 🔴 状态是**惰性推进**的：一次 get 只走一步（tied → releasing → recovery）。
+    #    真实系统每轮对话都会查，所以这不影响；但写测试（或者停了很久才查
+    #    第一次）的时候要知道，第一次读数可能落后一步。
+    assert ref.get(0.30, now=t0 + timedelta(minutes=20)).state == "releasing"
+    assert ref.get(0.30, now=t0 + timedelta(minutes=25)).state == "recovery"
+    revived = ReproductiveState(saved=json.loads(json.dumps(ref.saved)))
+    assert revived.get(0.30, now=t0 + timedelta(minutes=25)).state == "recovery", \
+        "只存 saved 就该把不应期带回来"
+    assert revived.start_penetration(0.90, now=t0 + timedelta(minutes=25))["ok"] is False
+
+    # ⑱ 时间可以不带时区：`datetime.now()` 是最自然的写法，不该在第二轮才炸
+    naive = ReproductiveState(consent_active=True)
+    assert naive.start_penetration(0.80, now=datetime(2026, 1, 1, 22, 0))["ok"]
+    assert naive.get(0.80, now=datetime(2026, 1, 1, 22, 5)).state == "inserted"
+
+    print("自检全部通过（18 组）")
     demo = ReproductiveState(consent_active=True)
     demo.start_penetration(0.80, now=t0)
     print("\n注入示例：")

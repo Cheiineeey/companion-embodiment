@@ -36,7 +36,13 @@ from reproductive_state import (
 #    每加一条生成通道，先问一句：它走这个函数了吗。
 def finish_turn(body: ReproductiveState, raw_text: str, arousal: float,
                 *, critical: bool = False, now: datetime) -> dict:
-    """一轮生成的收尾。返回给用户的正文 + 使用者能看到的动作痕迹。"""
+    """一轮生成的收尾。返回给用户的正文 + 使用者能看到的动作痕迹。
+
+    🔴 `arousal` 在这里是参数，只是为了让这个示例可以跑脚本。
+    **真接线时它必须在服务端现算**（我们线上是 `compute_arousal(get_emotions())`），
+    不能从请求体里拿 —— 否则调用方既报告"我进入了"，又提供用来
+    校验这件事的那个数字，"服务端独立校验"就只剩一个名字。
+    """
     text, want_insert, want_tie = strip_markers(raw_text)
     notices: list[str] = []
 
