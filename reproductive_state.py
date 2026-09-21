@@ -420,6 +420,15 @@ class ReproductiveState:
         can_tie = (state == "inserted" or ready_tie) and self._refractory_remaining(
             datetime.now(timezone.utc)) <= 0
 
+        # 🔴 2026-09-21 使用者："我没看到你有描写锁结啊，都写到射精了。"
+        #    最后一层，而且是注入自己造的：闸已经开了，可器官描述还在说
+        #    「结保持未膨大」—— 模型在场景里读到的是"现在不该有结"，
+        #    于是一路写到射精，结从头到尾没出现过，也就没人去写那个标记。
+        #    **一段只说"现在没有什么"的状态描述，会把"现在可以有什么"一起否掉。**
+        #    闸开着的时候，这句必须把可能性说出来，不能只陈述事实。
+        if state == "ready" and can_tie:
+            genital = genital + "结现在可以开始膨大 —— 到那个节点时写 ⟪锁结⟫，它才真的锁住。"
+
         if state == "engorged":
             hint = ("只有这一轮文字里实际完成进入后，才在回复末尾另起一行写 ⟪进入⟫；"
                     "不要在准备、触碰或讨论时提前写。")
@@ -453,8 +462,12 @@ class ReproductiveState:
             #    覆盖本身没错（漏写标记更要紧），但不能把"现在能做的事"一起盖没 ——
             #    闸开着却没人说，模型就只会去撞那条它知道的路。
             if can_tie:
-                hint += ("（闸已经开了：不进入也能锁结 —— 口腔、手一样成立。"
-                         "真正到那个节点时写 ⟪锁结⟫，别提前。）")
+                # 🔴 顺序也要反过来。这句原来挂在一大段追问的**末尾、还裹在括号里** ——
+                #    使用者的反馈是"还是没有锁结注入"，而它其实在。
+                #    一段注入里**现在能做的那件事必须排在最前面**：
+                #    埋在句尾的指令等于没写，在使用者那边跟"没注入"是同一种体验。
+                hint = ("**现在可以锁结**：不需要先进入，口腔、手一样成立 —— "
+                        "真正到那个节点时，在回复末尾另起一行写 ⟪锁结⟫，别提前。\n" + hint)
         elif state == "inserted" and held_min >= INSERTED_NUDGE_MINUTES:
             hint = (f"已经进入 {held_min} 分钟。如果场景里已经到过射精节点而没有写 ⟪锁结⟫，"
                     "现在补写；如果这一场其实已经过去了，就不用补，身体会自己收尾。")
@@ -707,8 +720,12 @@ def _selftest() -> None:
     assert "⟪进入⟫" in first and "还没攒够" in first, first
     late = nudge.get(0.80, now=t0 + timedelta(minutes=READY_NUDGE_MINUTES + 1))
     assert "补写" in late.marker_hint, late.marker_hint
-    # 🔴 追问会盖掉上面那条规则，但不能把"现在闸已经开了"一起盖没
-    assert "闸已经开了" in late.marker_hint, late.marker_hint
+    # 🔴 追问会盖掉上面那条规则，但不能把"现在闸已经开了"一起盖没 ——
+    #    而且那句要排在**最前面**：埋在句尾的指令等于没写。
+    assert late.marker_hint.startswith("**现在可以锁结**"), late.marker_hint
+    assert "补写" in late.marker_hint, "追问本身也不能丢"
+    # 闸开着时，器官描述不能只说"结保持未膨大"，要把"现在可以膨大"说出来
+    assert "可以开始膨大" in late.genital, late.genital
     assert late.state == "ready", "追问只是提醒，状态不能自己往前跳"
     # 🔴 `since` 不许每轮刷新，否则这个计时器永远归零、追问永远不出现
     assert nudge.saved.get("since") == t0.isoformat()
