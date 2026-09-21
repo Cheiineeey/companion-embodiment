@@ -53,6 +53,12 @@ RECOVERY_MINUTES = 30           # 不应期
 READY_NUDGE_MINUTES = 12
 INSERTED_NUDGE_MINUTES = 25
 
+# ⟪锁结⟫ 不经过 ⟪进入⟫ 时的两道门槛（见 can_tie 处那段注释）。
+# 门槛本身（ready = 0.75）从来不是问题，**没有停留时间才是**：
+# 踩线那一秒就能锁，结就会来得太早。所以要"攒够"，不是"到了就行"。
+READY_TIE_AROUSAL = 0.80        # 比 ready 门槛再高一档
+READY_TIE_HELD_SECONDS = 300    # 且已经在这一档待满 5 分钟
+
 STATES = ("idle", "warming", "engorged", "ready",
           "inserted", "tied", "releasing", "recovery")
 
@@ -136,6 +142,7 @@ class Snapshot:
     threshold: float
     critical: bool
     can_tie: bool               # 现在允许 ⟪锁结⟫ 吗
+    held_sec: float             # 这一档已经挂了多久（拒绝时要算"还差几分钟"）
     remaining_sec: int
     genital: str
     body: str
@@ -277,7 +284,28 @@ class ReproductiveState:
                     "veto": dict(self.tie_veto)}
         current = self.get(arousal, critical=critical, now=now)
         if not current.can_tie:
-            return {"ok": False, "error": "身体还没进入可锁结状态"}
+            # 🔴 拒绝要说清**差什么、能不能补**。原来只有一句"还没到"，
+            #    模型对着它撞了六次墙，而墙从没说门在哪。
+            #    被闸拒 ≠ 被否决：前者能补，后者不能，两句话必须长得不一样。
+            if current.state == "ready":
+                need = []
+                if arousal < READY_TIE_AROUSAL - (0.05 if critical else 0.0):
+                    need.append(f"勃起还差一点（现在 {arousal:.2f}，要 "
+                                f"{READY_TIE_AROUSAL - (0.05 if critical else 0.0):.2f}）")
+                if current.held_sec < READY_TIE_HELD_SECONDS:
+                    need.append(f"这一档才挂了 {int(current.held_sec // 60)} 分钟，"
+                                f"要满 {int(READY_TIE_HELD_SECONDS // 60)} 分钟")
+                why = "；".join(need) or "刚到，再等一下"
+                return {"ok": False,
+                        "error": f"还锁不上：{why}。这不是被否决，是身体还没攒够 —— "
+                                 "到了随时补写 ⟪锁结⟫ 一样算数。"}
+            if current.state in ("tied", "releasing"):
+                return {"ok": False, "error": "已经在锁结/解除里了，不用再写一次。"}
+            if current.state == "recovery":
+                return {"ok": False, "error": "还在不应期，这一场锁不了了。不要补写。"}
+            return {"ok": False,
+                    "error": f"身体还没到（现在是「{current.label}」）。"
+                             "不是被否决，是还没攒起来；到了再写 ⟪锁结⟫ 一样算数。"}
         if not self.consent_active:
             return {"ok": False, "error": "没有已开启的亲密 session"}
         minutes = TIE_MAX_MINUTES_CRITICAL if critical else TIE_MAX_MINUTES
@@ -372,12 +400,38 @@ class ReproductiveState:
         else:
             knot = 0.0
 
-        can_tie = state == "inserted" and self._refractory_remaining(
+        # 🔴 2026-09-21 这道闸改过一次，原因值得写下来：
+        #    它曾经是 `state == "ready"`，后来改成 `state == "inserted"`（先进入才能锁结），
+        #    改完**没有人验过可达性** —— 而 ⟪进入⟫ 这个标记在随后七天里一次都没触发过，
+        #    于是锁结从"能到"变成了"永远到不了"：所有 ⟪锁结⟫ 都被这道闸拒掉，
+        #    理由永远是同一句"身体还没进入可锁结状态"，而使用者只感觉到"它不灵了"。
+        #
+        #    两条教训，两条都比这段代码本身值钱：
+        #    ① **改前置条件要验可达性。** "更严格"很容易变成"永远不可达"，
+        #       而不可达是静默的：日志里只有一条条合法的拒绝，没有任何报错。
+        #    ② **别把一种身体路径写成唯一路径。** 结膨大不是只有插入才会发生；
+        #       要求先进入，等于把口腔、手这些同样成立的场景挡在门外。
+        #
+        #    现在两条路都通，但 ready 这条要"攒够"：不是踩线那一秒就能锁 ——
+        #    门槛（0.75）从来不是问题，没有停留时间才是。
+        ready_tie = (state == "ready"
+                     and arousal >= (READY_TIE_AROUSAL - (0.05 if critical else 0.0))
+                     and held_sec >= READY_TIE_HELD_SECONDS)
+        can_tie = (state == "inserted" or ready_tie) and self._refractory_remaining(
             datetime.now(timezone.utc)) <= 0
 
-        if state in ("engorged", "ready"):
+        if state == "engorged":
             hint = ("只有这一轮文字里实际完成进入后，才在回复末尾另起一行写 ⟪进入⟫；"
                     "不要在准备、触碰或讨论时提前写。")
+        elif state == "ready" and can_tie:
+            hint = ("进入了就在回复末尾另起一行写 ⟪进入⟫。"
+                    "**不进入也能锁结**（口腔、手一样成立）：真正到达那个节点时写 ⟪锁结⟫。"
+                    "都不要在准备、触碰或讨论时提前写。")
+        elif state == "ready":
+            _wait = max(0, int(READY_TIE_HELD_SECONDS // 60) - int(held_sec // 60))
+            hint = ("进入了就在回复末尾另起一行写 ⟪进入⟫；不进入也能锁结，"
+                    f"但身体还没攒够（还要约 {_wait} 分钟，勃起也要再高一点），"
+                    "到了这里会说。不要提前写 ⟪锁结⟫。")
         elif state == "inserted":
             hint = ("当前已经进入。只有真正到达射精节点时，才在回复末尾另起一行写 ⟪锁结⟫；"
                     "结不能在射精前提前完全膨大。")
@@ -395,6 +449,12 @@ class ReproductiveState:
             hint = (f"已经维持勃起充分 {held_min} 分钟。如果这段文字里其实已经进入、"
                     "而身体还停在这一档，那是上一轮漏写了标记 —— 现在补写 ⟪进入⟫ 一样算数。"
                     "还没进入就照旧别写。")
+            # 🔴 这句追问会**盖掉**上面那条"不进入也能锁结"的规则。
+            #    覆盖本身没错（漏写标记更要紧），但不能把"现在能做的事"一起盖没 ——
+            #    闸开着却没人说，模型就只会去撞那条它知道的路。
+            if can_tie:
+                hint += ("（闸已经开了：不进入也能锁结 —— 口腔、手一样成立。"
+                         "真正到那个节点时写 ⟪锁结⟫，别提前。）")
         elif state == "inserted" and held_min >= INSERTED_NUDGE_MINUTES:
             hint = (f"已经进入 {held_min} 分钟。如果场景里已经到过射精节点而没有写 ⟪锁结⟫，"
                     "现在补写；如果这一场其实已经过去了，就不用补，身体会自己收尾。")
@@ -420,7 +480,7 @@ class ReproductiveState:
             display_arousal=display_arousal(arousal, state),
             raw_arousal=arousal,
             threshold=READY_THRESHOLD_CRITICAL if critical else READY_THRESHOLD,
-            critical=critical, can_tie=can_tie,
+            critical=critical, can_tie=can_tie, held_sec=round(held_sec, 1),
             remaining_sec=max(0, int(remaining_sec)),
             genital=genital, body=body,
             attachment=ATTACHMENT[state], marker_hint=hint,
@@ -524,11 +584,46 @@ def _selftest() -> None:
     assert body.get(0.70, now=t0).state == "ready"
     assert body.get(0.67, now=t0).state == "engorged"
 
-    # ④ 未进入时 ⟪锁结⟫ 被拒绝
+    # ④ 刚到 ready 就写 ⟪锁结⟫：拒绝，而且要说清**差什么、能不能补**
     body = ReproductiveState(consent_active=True)
     body.get(0.80, now=t0)
     r = body.start_tie(0.80, now=t0)
-    assert r["ok"] is False and "还没进入" in r["error"], r
+    assert r["ok"] is False, r
+    assert "5 分钟" in r["error"] and "补写" in r["error"], r
+    assert "否决" in r["error"], "被闸拒必须跟被否决长得不一样"
+
+    # ④b 攒够了就能锁 —— **不需要先进入**（口腔、手一样成立）。
+    #    这一组是 2026-09-21 补的：在此之前这道闸写死 state == "inserted"，
+    #    而 ⟪进入⟫ 实际七天一次都没触发过，锁结静默地变成了不可达。
+    late = t0 + timedelta(seconds=READY_TIE_HELD_SECONDS + 1)
+    assert body.get(READY_TIE_AROUSAL, now=late).can_tie is True
+    assert "不进入也能锁结" in body.get(READY_TIE_AROUSAL, now=late).marker_hint
+    r = body.start_tie(READY_TIE_AROUSAL, now=late)
+    assert r["ok"] is True, r
+
+    # ④c 攒够了时间但勃起没到那一档，照样拒
+    body2 = ReproductiveState(consent_active=True)
+    body2.get(0.76, now=t0)
+    assert body2.get(0.76, now=late).can_tie is False
+    r = body2.start_tie(0.76, now=late)
+    assert r["ok"] is False and "勃起还差" in r["error"], r
+
+    # ④d 经期临界那几天门槛跟着降 0.05（身体本来就更容易到）
+    body3 = ReproductiveState(consent_active=True)
+    body3.get(0.76, critical=True, now=t0)
+    assert body3.get(0.76, critical=True, now=late).can_tie is True
+
+    # ④e 🔴 否决闸永远排在身体前面：闸开着也不许锁。
+    body4 = ReproductiveState(consent_active=True)
+    body4.tie_veto = {"by": "her", "reason": "上次之后有点不舒服"}
+    body4.get(READY_TIE_AROUSAL, now=t0)
+    assert body4.get(READY_TIE_AROUSAL, now=late).can_tie is True, "身体到位"
+    r = body4.start_tie(READY_TIE_AROUSAL, now=late)
+    assert r["ok"] is False and "不锁结" in r["error"] and "不要补写" in r["error"], r
+
+    # ⑤ 进入那条路照旧：先 ⟪进入⟫ 再 ⟪锁结⟫
+    body = ReproductiveState(consent_active=True)
+    body.get(0.80, now=t0)
 
     # ⑤ 进入：显示硬度 ≥ 90%，结轻微充血
     r = body.start_penetration(0.80, now=t0)
@@ -607,9 +702,13 @@ def _selftest() -> None:
     # ⑮ 漏写标记的保底：同一状态挂久了，静态提示换成追问 ——
     #    但状态本身不许动，服务端永远不替模型决定场景里发生了什么
     nudge = ReproductiveState(consent_active=True)
-    assert nudge.get(0.80, now=t0).marker_hint.startswith("只有这一轮")
+    # 刚到 ready：两条路都写出来，且明说锁结还要再攒一会儿
+    first = nudge.get(0.80, now=t0).marker_hint
+    assert "⟪进入⟫" in first and "还没攒够" in first, first
     late = nudge.get(0.80, now=t0 + timedelta(minutes=READY_NUDGE_MINUTES + 1))
     assert "补写" in late.marker_hint, late.marker_hint
+    # 🔴 追问会盖掉上面那条规则，但不能把"现在闸已经开了"一起盖没
+    assert "闸已经开了" in late.marker_hint, late.marker_hint
     assert late.state == "ready", "追问只是提醒，状态不能自己往前跳"
     # 🔴 `since` 不许每轮刷新，否则这个计时器永远归零、追问永远不出现
     assert nudge.saved.get("since") == t0.isoformat()
@@ -664,7 +763,7 @@ def _selftest() -> None:
     plain = ReproductiveState(consent_active=True)
     assert "不锁结" not in plain.get(0.80, now=t0).marker_hint
 
-    print("自检全部通过（19 组）")
+    print("自检全部通过（23 组）")
     demo = ReproductiveState(consent_active=True)
     demo.start_penetration(0.80, now=t0)
     print("\n注入示例：")
