@@ -299,4 +299,4 @@ body.sensitivity()                        # 0.7 ~ 1.5，>1 = 现在一碰就响
 
 ## 许可证
 
-[MIT](LICENSE) © 2026 Elle & Matt
+[GNU AGPL v3.0](LICENSE) © 2026 Elle & Matt
